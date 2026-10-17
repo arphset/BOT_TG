@@ -162,7 +162,7 @@ def build_steps(
             ),
             color,
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.2, amount=0.6)),
+            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.2, amount=0.48)),
         ]
     if mode is Mode.DENOISE:
         return [
@@ -215,7 +215,7 @@ def build_steps(
                 "sharpen",
                 "нерезкое маскирование",
                 "image",
-                partial(unsharp_mask, sigma=1.0, amount=0.4),
+                partial(unsharp_mask, sigma=1.0, amount=0.32),
             ),
         ]
     if mode in (Mode.NEURAL, Mode.NEURAL_WDN):
@@ -225,7 +225,7 @@ def build_steps(
             merge,
             _superres_step(variant, superres, frames[0].shape),
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.5)),
+            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.4)),
         ]
     if mode is Mode.AUTO_NEURAL:
         # Модель по шуму: x4v3 сильно чистит шум, wdn сохраняет текстуру.
@@ -246,7 +246,7 @@ def build_steps(
             ),
             color,
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.5)),
+            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.4)),
         ]
     raise ValueError(f"неизвестный режим: {mode}")
 
