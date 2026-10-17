@@ -16,7 +16,7 @@ def small() -> np.ndarray:
     return make_scene(48, 64)
 
 
-@pytest.mark.parametrize("variant", ["general", "wdn"])
+@pytest.mark.parametrize("variant", ["general", "balanced", "wdn"])
 def test_models_present_and_upscale_x4(variant: str, small: np.ndarray) -> None:
     assert superres.model_path(variant).exists()
     original = small.copy()
@@ -69,3 +69,10 @@ def test_missing_model_raises(small: np.ndarray, monkeypatch: pytest.MonkeyPatch
 def test_unknown_variant(small: np.ndarray) -> None:
     with pytest.raises(ValueError):
         realesrgan(small, variant="nope")  # type: ignore[arg-type]
+
+
+def test_balanced_is_between_general_and_wdn() -> None:
+    noisy = add_noise(make_scene(48, 64), 15)
+    lap = lambda im: cv2.Laplacian(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()  # noqa: E731
+    general, balanced, wdn = (lap(realesrgan(noisy, variant=v)) for v in ("general", "balanced", "wdn"))
+    assert general < balanced < wdn

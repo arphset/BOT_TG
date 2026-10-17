@@ -11,6 +11,7 @@ from bot.pipeline import (
     SuperResSettings,
     build_steps,
     order_steps,
+    pick_variant,
     run_pipeline,
     toggle,
 )
@@ -141,15 +142,22 @@ def test_flags_are_independent(scene: np.ndarray) -> None:
 
 def test_auto_neural_order(scene: np.ndarray) -> None:
     names = [s.name for s in build_steps(Mode.AUTO_NEURAL, [scene])]
-    assert names == ["align", "merge", "superres", "denoise", "color", "contrast", "sharpen"]
+    assert names == ["align", "merge", "superres", "deblock", "denoise", "color", "contrast", "sharpen"]
 
 
 def test_auto_neural_picks_model_by_noise(scene: np.ndarray) -> None:
     def superres_title(img: np.ndarray) -> str:
         return next(s.title for s in build_steps(Mode.AUTO_NEURAL, [img]) if s.name == "superres")
 
-    assert "wdn" in superres_title(scene)
-    assert "general" in superres_title(add_noise(scene, 15))
+    assert superres_title(scene).endswith("(wdn-x4v3)")
+    assert "50/50" in superres_title(add_noise(scene, 3))
+    assert superres_title(add_noise(scene, 15)).endswith("(x4v3)")
+
+
+def test_pick_variant_thresholds() -> None:
+    assert pick_variant(0.5) == "wdn"
+    assert pick_variant(2.5) == "balanced"
+    assert pick_variant(8.0) == "general"
 
 
 def test_auto_neural_skips_classic_denoise_when_model_works() -> None:
@@ -163,15 +171,11 @@ def test_auto_neural_skips_classic_denoise_when_model_works() -> None:
 def test_auto_neural_falls_back_to_auto(scene: np.ndarray) -> None:
     noisy = add_noise(scene, 15)
     steps = build_steps(Mode.AUTO_NEURAL, [noisy], SuperResSettings(time_budget=1e-6, tile=32))
+    titles = {s.title: s.name for s in steps}
     result = run_pipeline([noisy], steps)
     assert [e.name for e in result.errors] == ["superres"]
     assert result.image.shape == noisy.shape
-    assert result.applied == [
-        "шумоподавление (non-local means)",
-        "цветокоррекция (баланс белого, уровни, вибрация)",
-        "локальный контраст (CLAHE, Lab)",
-        "нерезкое маскирование",
-    ]
+    assert [titles[t] for t in result.applied] == ["denoise", "color", "contrast", "sharpen"]
 
 
 def test_fallback_runs_when_primary_disabled(scene: np.ndarray) -> None:

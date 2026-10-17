@@ -7,7 +7,9 @@
 Варианты (по официальному inference_realesrgan.py, параметр ``-dn``):
 * ``general`` — realesr-general-x4v3, сильное шумоподавление (``-dn 1``); подходит для шумных кадров;
 * ``wdn``     — realesr-general-wdn-x4v3, слабое шумоподавление (``-dn 0``): меньше «пластика»,
-  сохраняет мелкую текстуру, но оставляет шум.
+  сохраняет мелкую текстуру, но оставляет шум;
+* ``balanced`` — смесь весов x4v3 и wdn 50/50 (DNI, как ``-dn 0.5`` — значение по умолчанию
+  в официальном скрипте): промежуточный вариант между «чисто» и «детально».
 """
 
 from __future__ import annotations
@@ -30,9 +32,15 @@ SCALE = 4
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 VARIANTS: dict[str, str] = {
     "general": "realesr-general-x4v3.onnx",
+    "balanced": "realesr-general-dn05-x4v3.onnx",
     "wdn": "realesr-general-wdn-x4v3.onnx",
 }
-Variant = Literal["general", "wdn"]
+VARIANT_TITLES: dict[str, str] = {
+    "general": "x4v3",
+    "balanced": "x4v3 + wdn 50/50",
+    "wdn": "wdn-x4v3",
+}
+Variant = Literal["general", "balanced", "wdn"]
 
 
 class SuperResUnavailable(RuntimeError):

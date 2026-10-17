@@ -1,4 +1,5 @@
-"""Скачивание весов Real-ESRGAN (realesr-general-x4v3 и wdn) и экспорт в ONNX.
+"""Скачивание весов Real-ESRGAN (realesr-general-x4v3 и wdn) и экспорт в ONNX,
+плюс смешанная модель dn0.5 (DNI-интерполяция весов, как ``-dn 0.5`` в официальном скрипте).
 
 Готовые .onnx уже лежат в models/, скрипт нужен, только чтобы воспроизвести их.
 Официальный репозиторий публикует веса только в формате PyTorch (.pth),
@@ -64,9 +65,17 @@ def download(name: str, sha256: str, folder: Path) -> Path:
     return path
 
 
-def export(pth: Path, onnx_path: Path) -> None:
+def load_state(pth: Path) -> dict[str, torch.Tensor]:
     state = torch.load(pth, map_location="cpu", weights_only=True)  # без исполнения pickle-кода
-    state = state.get("params_ema") or state.get("params") or state
+    return state.get("params_ema") or state.get("params") or state
+
+
+def dni(state_a: dict[str, torch.Tensor], state_b: dict[str, torch.Tensor], weight_a: float) -> dict[str, torch.Tensor]:
+    """Deep Network Interpolation, как в официальном RealESRGANer: w·A + (1−w)·B."""
+    return {k: weight_a * state_a[k] + (1.0 - weight_a) * state_b[k] for k in state_a}
+
+
+def export(state: dict[str, torch.Tensor], onnx_path: Path) -> None:
     model = SRVGGNetCompact()
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -89,12 +98,19 @@ def export(pth: Path, onnx_path: Path) -> None:
     logger.info("%s: %d байт, max |torch - onnx| = %.1e", onnx_path.name, onnx_path.stat().st_size, np.abs(ref - got).max())
 
 
+DNI_WEIGHT = 0.5  # как -dn 0.5, значение по умолчанию в официальном inference_realesrgan.py
+
+
 def main() -> None:
     out_dir = ROOT / "models"
     out_dir.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
-        for name, sha in WEIGHTS.items():
-            export(download(name, sha, Path(tmp)), out_dir / f"{name}.onnx")
+        states = {name: load_state(download(name, sha, Path(tmp))) for name, sha in WEIGHTS.items()}
+    for name, state in states.items():
+        export(state, out_dir / f"{name}.onnx")
+    # Смесь: x4v3 (сильное шумоподавление) и wdn (слабое) пополам.
+    blended = dni(states["realesr-general-x4v3"], states["realesr-general-wdn-x4v3"], DNI_WEIGHT)
+    export(blended, out_dir / "realesr-general-dn05-x4v3.onnx")
 
 
 if __name__ == "__main__":

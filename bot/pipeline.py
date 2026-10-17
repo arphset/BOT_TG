@@ -30,13 +30,14 @@ from bot.algorithms import (
     clahe_lab,
     estimate_noise,
     merge_mertens,
-    nl_means,
-    richardson_lucy,
     unsharp_mask,
 )
-from bot.algorithms.hdr import exposure_spread
 from bot.algorithms.color import color_correct
-from bot.algorithms.superres import OutputMode, Variant, output_is_x4, realesrgan_fit
+from bot.algorithms.deblock import deblock, is_blocky
+from bot.algorithms.deblur import describe_blur, estimate_blur, smart_deblur
+from bot.algorithms.denoise import denoise_by_luma
+from bot.algorithms.hdr import exposure_spread
+from bot.algorithms.superres import VARIANT_TITLES, OutputMode, Variant, output_is_x4, realesrgan_fit
 
 logger = logging.getLogger(__name__)
 
@@ -119,9 +120,17 @@ def _merge_series(frames: Sequence[np.ndarray]) -> np.ndarray:
     return average_frames(frames)
 
 
-def _auto_denoise_strength(sigma: float) -> float:
-    """Сила NLM для яркости; цвет чистится сильнее (см. denoise.CHROMA_RATIO)."""
-    return float(np.clip(sigma * 1.05, 2.5, 10.0))
+NOISE_STRONG = 3.5  # σ выше — сильный шум
+NOISE_MILD = 1.5  # σ ниже — кадр практически чистый
+
+
+def pick_variant(sigma: float) -> Variant:
+    """Модель Real-ESRGAN по оценке шума: сильный → x4v3, средний → смесь 50/50, чистый → wdn."""
+    if sigma > NOISE_STRONG:
+        return "general"
+    if sigma > NOISE_MILD:
+        return "balanced"
+    return "wdn"
 
 
 def build_steps(
@@ -131,122 +140,109 @@ def build_steps(
 ) -> list[Step]:
     """Собирает список шагов для режима.
 
-    Для «Авто» и «Полного конвейера» сила шумоподавления подбирается
-    по оценке шума первого кадра. Деконволюция включается только в
-    режимах «Размытие» и «Полный конвейер», то есть по явному выбору.
+    Классический порядок: выравнивание → слияние → деблокинг JPEG → шумоподавление
+    → деконволюция → цветокоррекция → CLAHE → нерезкое маскирование.
+    Деблокинг включается, только если в кадре найдена сетка JPEG-блоков;
+    шумоподавление — по оценке шума (сила по зонам яркости); деконволюция —
+    только в «Размытии» и «Полном конвейере», с ядром, оценённым по кадру.
 
-    Нейросетевые режимы идут в фиксированном порядке:
-    выравнивание → слияние → Real-ESRGAN → CLAHE → нерезкое маскирование.
+    Нейросетевые режимы: выравнивание → слияние → Real-ESRGAN → CLAHE → резкость
+    (в «Авто + нейросеть» ещё цветокоррекция и запасные классические шаги).
     """
-    sigma = estimate_noise(frames[0])
+    first = frames[0]
+    sigma = estimate_noise(first)
     multi = len(frames) > 1
     # После усреднения N кадров шум меньше примерно в √N раз.
     effective_sigma = sigma / np.sqrt(len(frames)) if multi else sigma
-    logger.info("режим=%s, кадров=%d, оценка шума σ=%.2f", mode.value, len(frames), sigma)
+    blocky = is_blocky(first)
+    logger.info("режим=%s, кадров=%d, шум σ=%.2f, JPEG-блоки=%s", mode.value, len(frames), sigma, blocky)
 
     align = Step("align", "выравнивание кадров (ECC)", "series", align_frames, enabled=multi)
     merge = Step("merge", "слияние серии (Mertens / усреднение)", "merge", _merge_series, enabled=multi)
     color = Step("color", "цветокоррекция (баланс белого, уровни, вибрация)", "image", color_correct)
 
+    def deblock_step(**kw: object) -> Step:
+        return Step("deblock", "удаление JPEG-артефактов (деблокинг)", "image", deblock, enabled=blocky, **kw)  # type: ignore[arg-type]
+
+    def denoise_step(enabled: bool = True, min_strength: float = 2.5, **kw: object) -> Step:
+        return Step(
+            "denoise",
+            "шумоподавление (non-local means, по зонам яркости)",
+            "image",
+            partial(denoise_by_luma, min_strength=min_strength),
+            enabled=enabled,
+            **kw,  # type: ignore[arg-type]
+        )
+
+    def deblur_step() -> Step:
+        blur = estimate_blur(first)
+        return Step(
+            "deblur",
+            f"деконволюция Ричардсона–Люси ({describe_blur(blur)})",
+            "image",
+            partial(smart_deblur, blur=blur),
+        )
+
+    def contrast_step(clip: float) -> Step:
+        return Step(
+            "contrast",
+            "локальный контраст (адаптивный CLAHE, Lab)",
+            "image",
+            partial(clahe_lab, clip_limit=clip, adaptive=True),
+        )
+
+    def sharpen_step(sigma_px: float, amount: float) -> Step:
+        return Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=sigma_px, amount=amount))
+
     if mode is Mode.AUTO:
-        need_denoise = effective_sigma > 2.0
         return [
             align,
             merge,
-            Step(
-                "denoise",
-                "шумоподавление (non-local means)",
-                "image",
-                partial(nl_means, strength=_auto_denoise_strength(effective_sigma)),
-                enabled=need_denoise,
-            ),
+            deblock_step(),
+            denoise_step(enabled=effective_sigma > 2.0),
             color,
-            Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.2, amount=0.48)),
+            contrast_step(1.5),
+            sharpen_step(1.2, 0.48),
         ]
     if mode is Mode.DENOISE:
-        return [
-            align,
-            merge,
-            Step(
-                "denoise",
-                "шумоподавление (non-local means)",
-                "image",
-                partial(nl_means, strength=max(6.0, _auto_denoise_strength(effective_sigma))),
-            ),
-        ]
+        return [align, merge, deblock_step(), denoise_step(min_strength=6.0)]
     if mode is Mode.SHARPEN:
-        return [
-            align,
-            merge,
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=1.0)),
-        ]
+        return [align, merge, deblock_step(), sharpen_step(1.5, 1.0)]
     if mode is Mode.DEBLUR:
-        return [
-            align,
-            merge,
-            Step(
-                "deblur",
-                "деконволюция Ричардсона–Люси",
-                "image",
-                partial(richardson_lucy, psf_sigma=1.5, iterations=15),
-            ),
-        ]
+        return [align, merge, deblock_step(), deblur_step()]
     if mode is Mode.FULL:
         return [
             align,
             merge,
-            Step(
-                "denoise",
-                "шумоподавление (non-local means)",
-                "image",
-                partial(nl_means, strength=_auto_denoise_strength(effective_sigma)),
-                enabled=effective_sigma > 1.0,
-            ),
-            Step(
-                "deblur",
-                "деконволюция Ричардсона–Люси",
-                "image",
-                partial(richardson_lucy, psf_sigma=1.0, iterations=10),
-            ),
+            deblock_step(),
+            denoise_step(enabled=effective_sigma > 1.0),
+            deblur_step(),
             color,
-            Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=2.0)),
-            Step(
-                "sharpen",
-                "нерезкое маскирование",
-                "image",
-                partial(unsharp_mask, sigma=1.0, amount=0.32),
-            ),
+            contrast_step(2.0),
+            sharpen_step(1.0, 0.32),
         ]
     if mode in (Mode.NEURAL, Mode.NEURAL_WDN):
         variant: Variant = "wdn" if mode is Mode.NEURAL_WDN else "general"
         return [
             align,
             merge,
-            _superres_step(variant, superres, frames[0].shape),
-            Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.4)),
+            _superres_step(variant, superres, first.shape),
+            contrast_step(1.5),
+            sharpen_step(1.5, 0.4),
         ]
     if mode is Mode.AUTO_NEURAL:
-        # Модель по шуму: x4v3 сильно чистит шум, wdn сохраняет текстуру.
-        # Классическое шумоподавление перед нейросетью не нужно — модель чистит сама;
-        # оно включается только как запасной шаг, если нейросеть не применилась.
-        noisy = effective_sigma > 2.0
+        # Модель по шуму: x4v3 сильно чистит шум, wdn сохраняет текстуру, смесь 50/50 — между ними.
+        # Классические деблокинг и шумоподавление перед нейросетью не нужны — модель справляется
+        # сама; они включаются только как запасные шаги, если нейросеть не применилась.
         return [
             align,
             merge,
-            _superres_step("general" if noisy else "wdn", superres, frames[0].shape),
-            Step(
-                "denoise",
-                "шумоподавление (non-local means)",
-                "image",
-                partial(nl_means, strength=_auto_denoise_strength(effective_sigma)),
-                enabled=noisy,
-                fallback_for="superres",
-            ),
+            _superres_step(pick_variant(effective_sigma), superres, first.shape),
+            deblock_step(fallback_for="superres"),
+            denoise_step(enabled=effective_sigma > 2.0, fallback_for="superres"),
             color,
-            Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
-            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.4)),
+            contrast_step(1.5),
+            sharpen_step(1.5, 0.4),
         ]
     raise ValueError(f"неизвестный режим: {mode}")
 
@@ -255,7 +251,7 @@ def _superres_step(variant: Variant, superres: SuperResSettings, shape: tuple[in
     size = "×4" if output_is_x4(shape, superres.output, superres.max_side) else "в исходном размере"
     return Step(
         "superres",
-        f"нейросеть Real-ESRGAN {size} ({variant}-x4v3)",
+        f"нейросеть Real-ESRGAN {size} ({VARIANT_TITLES[variant]})",
         "image",
         partial(
             realesrgan_fit,
