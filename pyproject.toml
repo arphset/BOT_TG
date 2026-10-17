@@ -2,6 +2,16 @@
 name = "photo-bot"
 version = "0.1.0"
 requires-python = ">=3.11"
+# Vercel берёт зависимости отсюда (при наличии pyproject.toml); requirements.txt держим в том же составе
+dependencies = [
+    "aiogram>=3.13,<4",
+    "opencv-python-headless>=4.10,<5",
+    "numpy>=1.26,<3",
+    "onnxruntime>=1.20,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "uvicorn>=0.30"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
