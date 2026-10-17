@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import sys
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -104,7 +105,8 @@ async def app(scope: Scope, receive: Receive, send: Send) -> None:
         return
 
     if scope.get("method") != "POST":
-        await _respond(send, 200, b"photo-bot webhook is alive")
+        version = os.getenv("VERCEL_GIT_COMMIT_SHA", "local")[:7]
+        await _respond(send, 200, f"photo-bot webhook is alive ({version})".encode())
         return
 
     try:
