@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/webhook.py": {
+      "maxDuration": 300,
+      "memory": 2048,
+      "includeFiles": "models/*.onnx",
+      "excludeFiles": "{tests/**,scripts/**,.venv/**,**/__pycache__/**}"
+    }
+  },
+  "rewrites": [
+    { "source": "/webhook", "destination": "/api/webhook" }
+  ]
+}
