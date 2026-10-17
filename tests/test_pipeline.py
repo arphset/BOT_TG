@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from bot.pipeline import (
+    NEURAL_MODES,
     Mode,
     PipelineCancelled,
     Step,
@@ -13,14 +14,14 @@ from bot.pipeline import (
     run_pipeline,
     toggle,
 )
-from tests.conftest import add_noise
+from tests.conftest import add_noise, make_scene
 
 
 @pytest.mark.parametrize("mode", list(Mode))
 def test_every_mode_runs_on_single_frame(mode: Mode, scene: np.ndarray) -> None:
     frames = [add_noise(scene, 8)]
     result = run_pipeline(frames, build_steps(mode, frames))
-    scale = 4 if mode in (Mode.NEURAL, Mode.NEURAL_WDN) else 1
+    scale = 4 if mode in NEURAL_MODES else 1
     assert result.image.shape == (scene.shape[0] * scale, scene.shape[1] * scale, 3)
     assert result.image.dtype == np.uint8
     assert result.errors == []
@@ -136,6 +137,43 @@ def test_flags_are_independent(scene: np.ndarray) -> None:
     result = run_pipeline([small], steps)
     assert not any("CLAHE" in s for s in result.applied)
     assert result.image.shape == (192, 256, 3)
+
+
+def test_auto_neural_order(scene: np.ndarray) -> None:
+    names = [s.name for s in build_steps(Mode.AUTO_NEURAL, [scene])]
+    assert names == ["align", "merge", "superres", "denoise", "contrast", "sharpen"]
+
+
+def test_auto_neural_picks_model_by_noise(scene: np.ndarray) -> None:
+    def superres_title(img: np.ndarray) -> str:
+        return next(s.title for s in build_steps(Mode.AUTO_NEURAL, [img]) if s.name == "superres")
+
+    assert "wdn" in superres_title(scene)
+    assert "general" in superres_title(add_noise(scene, 15))
+
+
+def test_auto_neural_skips_classic_denoise_when_model_works() -> None:
+    small = add_noise(make_scene(48, 64), 15)
+    result = run_pipeline([small], build_steps(Mode.AUTO_NEURAL, [small]))
+    assert result.errors == []
+    assert result.image.shape == (192, 256, 3)
+    assert not any("non-local" in s for s in result.applied)
+
+
+def test_auto_neural_falls_back_to_auto(scene: np.ndarray) -> None:
+    noisy = add_noise(scene, 15)
+    steps = build_steps(Mode.AUTO_NEURAL, [noisy], SuperResSettings(time_budget=1e-6, tile=32))
+    result = run_pipeline([noisy], steps)
+    assert [e.name for e in result.errors] == ["superres"]
+    assert result.image.shape == noisy.shape
+    assert result.applied == ["шумоподавление (non-local means)", "локальный контраст (CLAHE, Lab)", "нерезкое маскирование"]
+
+
+def test_fallback_runs_when_primary_disabled(scene: np.ndarray) -> None:
+    noisy = add_noise(scene, 15)
+    steps = build_steps(Mode.AUTO_NEURAL, [noisy], SuperResSettings(enabled=False))
+    result = run_pipeline([noisy], steps)
+    assert any("non-local" in s for s in result.applied)
 
 
 def test_stop_flag_cancels(scene: np.ndarray) -> None:

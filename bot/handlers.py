@@ -55,6 +55,8 @@ HELP_TEXT = (
     "• <b>Резкость</b> — нерезкое маскирование.\n"
     "• <b>Размытие</b> — деконволюция Ричардсона–Люси (для слегка смазанных кадров).\n"
     "• <b>Полный конвейер</b> — шум → деконволюция → контраст → резкость.\n"
+    "• <b>Авто + нейросеть</b> — модель подбирается по шуму (шумное фото — сильная чистка, чистое — «детали»), "
+    "затем контраст и мягкая резкость. Если нейросеть не успела, выполняется обычное «Авто».\n"
     "• <b>Нейросеть ×4</b> — Real-ESRGAN (realesr-general-x4v3) → контраст → мягкая резкость. "
     "Кадр уменьшается до 1024 px и увеличивается в 4 раза; подходит для небольших и пережатых фото. "
     "Обычный вариант сильнее подавляет шум; «детали» (модель wdn) сглаживает меньше и сохраняет текстуру. "
@@ -95,6 +97,9 @@ def modes_keyboard(prefix: str, with_reset: bool = False) -> InlineKeyboardMarku
         [InlineKeyboardButton(text=MODE_TITLES[Mode.FULL], callback_data=f"{prefix}:{Mode.FULL.value}")],
     ]
     if get_config().sr_enabled:
+        rows.append(
+            [InlineKeyboardButton(text=MODE_TITLES[Mode.AUTO_NEURAL], callback_data=f"{prefix}:{Mode.AUTO_NEURAL.value}")]
+        )
         rows.append(
             [
                 InlineKeyboardButton(text=MODE_TITLES[Mode.NEURAL], callback_data=f"{prefix}:{Mode.NEURAL.value}"),

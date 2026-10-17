@@ -205,7 +205,7 @@ async def test_photo_document_gets_mode_keyboard(session: FakeSession) -> None:
     await call_app(body={"update_id": 2, "message": document_message("f1")})
     [msg] = session.of_type(SendMessage)
     buttons = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
-    assert buttons == ["Авто", "Шум", "Резкость", "Размытие", "Полный конвейер", "Нейросеть ×4", "Нейросеть ×4, детали"]
+    assert buttons == ["Авто", "Шум", "Резкость", "Размытие", "Полный конвейер", "Авто + нейросеть", "Нейросеть ×4", "Нейросеть ×4, детали"]
     assert msg.reply_parameters.message_id == 5
 
 

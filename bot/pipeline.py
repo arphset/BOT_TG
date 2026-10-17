@@ -35,7 +35,7 @@ from bot.algorithms import (
     unsharp_mask,
 )
 from bot.algorithms.hdr import exposure_spread
-from bot.algorithms.superres import realesrgan
+from bot.algorithms.superres import Variant, realesrgan
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ class Mode(str, Enum):
     FULL = "full"
     NEURAL = "neural"
     NEURAL_WDN = "neural_wdn"
+    AUTO_NEURAL = "auto_neural"
 
 
 MODE_TITLES: dict[Mode, str] = {
@@ -60,7 +61,10 @@ MODE_TITLES: dict[Mode, str] = {
     Mode.FULL: "Полный конвейер",
     Mode.NEURAL: "Нейросеть ×4",
     Mode.NEURAL_WDN: "Нейросеть ×4, детали",
+    Mode.AUTO_NEURAL: "Авто + нейросеть",
 }
+
+NEURAL_MODES = frozenset({Mode.NEURAL, Mode.NEURAL_WDN, Mode.AUTO_NEURAL})
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,9 @@ class Step:
     kind: StepKind
     func: Callable[..., object]
     enabled: bool = True
+    # Запасной шаг: выполняется, только если шаг с этим именем не применился
+    # (выключен флагом, упал или не уложился во время).
+    fallback_for: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,28 +213,52 @@ def build_steps(
             ),
         ]
     if mode in (Mode.NEURAL, Mode.NEURAL_WDN):
-        variant = "wdn" if mode is Mode.NEURAL_WDN else "general"
+        variant: Variant = "wdn" if mode is Mode.NEURAL_WDN else "general"
         return [
             align,
             merge,
+            _superres_step(variant, superres),
+            Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
+            Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.5)),
+        ]
+    if mode is Mode.AUTO_NEURAL:
+        # Модель по шуму: x4v3 сильно чистит шум, wdn сохраняет текстуру.
+        # Классическое шумоподавление перед нейросетью не нужно — модель чистит сама;
+        # оно включается только как запасной шаг, если нейросеть не применилась.
+        noisy = effective_sigma > 2.0
+        return [
+            align,
+            merge,
+            _superres_step("general" if noisy else "wdn", superres),
             Step(
-                "superres",
-                f"нейросеть Real-ESRGAN ×4 ({'wdn' if variant == 'wdn' else 'general'}-x4v3)",
+                "denoise",
+                "шумоподавление (non-local means)",
                 "image",
-                partial(
-                    realesrgan,
-                    variant=variant,
-                    max_side=superres.max_side,
-                    tile=superres.tile,
-                    overlap=superres.overlap,
-                    time_budget=superres.time_budget,
-                ),
-                enabled=superres.enabled,
+                partial(nl_means, strength=_auto_denoise_strength(effective_sigma)),
+                enabled=noisy,
+                fallback_for="superres",
             ),
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
             Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.5)),
         ]
     raise ValueError(f"неизвестный режим: {mode}")
+
+
+def _superres_step(variant: Variant, superres: SuperResSettings) -> Step:
+    return Step(
+        "superres",
+        f"нейросеть Real-ESRGAN ×4 ({variant}-x4v3)",
+        "image",
+        partial(
+            realesrgan,
+            variant=variant,
+            max_side=superres.max_side,
+            tile=superres.tile,
+            overlap=superres.overlap,
+            time_budget=superres.time_budget,
+        ),
+        enabled=superres.enabled,
+    )
 
 
 def order_steps(steps: Sequence[Step]) -> list[Step]:
@@ -256,9 +287,12 @@ def run_pipeline(
     series: list[np.ndarray] = list(frames)
     image: np.ndarray | None = None
     result = PipelineResult(image=frames[0])
+    done: set[str] = set()
 
     for step in order_steps(steps):
         if not step.enabled:
+            continue
+        if step.fallback_for is not None and step.fallback_for in done:
             continue
         if should_stop():
             raise PipelineCancelled("обработка остановлена по таймауту")
@@ -281,6 +315,7 @@ def run_pipeline(
         finally:
             result.timings[step.name] = time.perf_counter() - t0
         result.applied.append(step.title)
+        done.add(step.name)
 
     result.image = image if image is not None else series[0]
     result.elapsed = time.perf_counter() - started
