@@ -141,7 +141,7 @@ def test_flags_are_independent(scene: np.ndarray) -> None:
 
 def test_auto_neural_order(scene: np.ndarray) -> None:
     names = [s.name for s in build_steps(Mode.AUTO_NEURAL, [scene])]
-    assert names == ["align", "merge", "superres", "denoise", "contrast", "sharpen"]
+    assert names == ["align", "merge", "superres", "denoise", "color", "contrast", "sharpen"]
 
 
 def test_auto_neural_picks_model_by_noise(scene: np.ndarray) -> None:
@@ -166,7 +166,12 @@ def test_auto_neural_falls_back_to_auto(scene: np.ndarray) -> None:
     result = run_pipeline([noisy], steps)
     assert [e.name for e in result.errors] == ["superres"]
     assert result.image.shape == noisy.shape
-    assert result.applied == ["шумоподавление (non-local means)", "локальный контраст (CLAHE, Lab)", "нерезкое маскирование"]
+    assert result.applied == [
+        "шумоподавление (non-local means)",
+        "цветокоррекция (баланс белого, уровни, вибрация)",
+        "локальный контраст (CLAHE, Lab)",
+        "нерезкое маскирование",
+    ]
 
 
 def test_fallback_runs_when_primary_disabled(scene: np.ndarray) -> None:

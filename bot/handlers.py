@@ -25,7 +25,16 @@ from aiogram.types import (
 )
 
 from bot.config import get_config
-from bot.media import ImageDecodeError, decode_image, encode_image, fit, limit_megapixels, make_comparison
+from bot.media import (
+    ImageDecodeError,
+    decode_image,
+    encode_image,
+    fit,
+    limit_megapixels,
+    make_comparison,
+    read_meta,
+    to_srgb,
+)
 from bot.pipeline import (
     MODE_TITLES,
     Mode,
@@ -50,7 +59,7 @@ HELP_TEXT = (
     "2. Выберите режим кнопкой.\n"
     "3. Получите результат файлом без сжатия, превью и сравнение «до / после».\n\n"
     "<b>Режимы</b>\n"
-    "• <b>Авто</b> — шумоподавление по оценке шума, локальный контраст, лёгкая резкость.\n"
+    "• <b>Авто</b> — шумоподавление по оценке шума, цветокоррекция (баланс белого, уровни), локальный контраст, лёгкая резкость.\n"
     "• <b>Шум</b> — только non-local means.\n"
     "• <b>Резкость</b> — нерезкое маскирование.\n"
     "• <b>Размытие</b> — деконволюция Ричардсона–Люси (для слегка смазанных кадров).\n"
@@ -58,7 +67,7 @@ HELP_TEXT = (
     "• <b>Авто + нейросеть</b> — модель подбирается по шуму (шумное фото — сильная чистка, чистое — «детали»), "
     "затем контраст и мягкая резкость. Если нейросеть не успела, выполняется обычное «Авто».\n"
     "• <b>Нейросеть ×4</b> — Real-ESRGAN (realesr-general-x4v3) → контраст → мягкая резкость. "
-    "Кадр уменьшается до 1024 px и увеличивается в 4 раза; подходит для небольших и пережатых фото. "
+    "Маленькие фото (до 1024 px) увеличиваются в 4 раза, большие остаются в исходном размере, а реальные детали переносятся из оригинала. "
     "Обычный вариант сильнее подавляет шум; «детали» (модель wdn) сглаживает меньше и сохраняет текстуру. "
     "Обработка до нескольких минут.\n\n"
     "<b>Команды</b>\n"
@@ -330,6 +339,7 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
         )
         return
     image, downscaled = limit_megapixels(image, cfg.max_megapixels)
+    meta = read_meta(data)
 
     stop = threading.Event()
     frames = [image]
@@ -338,6 +348,7 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
         max_side=cfg.sr_max_side,
         tile=cfg.sr_tile,
         time_budget=cfg.sr_timeout,
+        output=cfg.sr_output,  # type: ignore[arg-type]
     )
     try:
         result = await asyncio.wait_for(
@@ -357,17 +368,19 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
         return
 
     out_name, fmt = _output_name(source.file_name)
+    # Документ — с исходным ICC-профилем и EXIF; превью — в sRGB, потому что
+    # Telegram пережимает фото и выбрасывает профиль.
     encoded, preview, comparison = await asyncio.to_thread(
         lambda: (
-            encode_image(result.image, fmt),
-            encode_image(fit(result.image, PREVIEW_MAX_SIDE), "jpg", 90),
-            encode_image(make_comparison(image, result.image), "jpg", 88),
+            encode_image(result.image, fmt, meta=meta),
+            encode_image(to_srgb(fit(result.image, PREVIEW_MAX_SIDE), meta), "jpg", 90),
+            encode_image(to_srgb(make_comparison(image, result.image), meta), "jpg", 88),
         )
     )
     if len(encoded) > UPLOAD_LIMIT and fmt == "png":
         # Бот может отправить файл до 50 МБ; большой PNG пересохраняем в JPEG.
         out_name = PurePath(out_name).with_suffix(".jpg").name
-        encoded = await asyncio.to_thread(encode_image, result.image, "jpg", 95)
+        encoded = await asyncio.to_thread(lambda: encode_image(result.image, "jpg", 95, meta=meta))
     report = _format_report(result, time.perf_counter() - started, downscaled, mode)
 
     await original.reply_media_group(

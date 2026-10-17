@@ -23,6 +23,9 @@ def estimate_noise(image: np.ndarray) -> float:
     return float(np.sqrt(np.pi / 2.0) * inner.sum() / (6.0 * (w - 2) * (h - 2)))
 
 
+CHROMA_RATIO = 1.8
+
+
 def nl_means(
     image: np.ndarray,
     strength: float = 7.0,
@@ -32,12 +35,15 @@ def nl_means(
 ) -> np.ndarray:
     """Цветное шумоподавление non-local means (``fastNlMeansDenoisingColored``).
 
-    ``strength`` — параметр h для яркости; ``color_strength`` — для цвета
-    (по умолчанию равен ``strength``). Окно поиска 15 вместо стандартного 21
+    OpenCV чистит отдельно яркость (L, сила ``strength``) и цвет (a/b,
+    сила ``color_strength``). Цветной шум — разноцветные пятна в тенях —
+    заметнее и неприятнее яркостного «зерна», поэтому по умолчанию цвет
+    чистится в ``CHROMA_RATIO`` раз сильнее: пятна уходят, а текстура
+    не превращается в «пластик». Окно поиска 15 вместо стандартного 21
     заметно быстрее при почти том же качестве.
     """
     ensure_bgr_u8(image)
-    h_color = strength if color_strength is None else color_strength
+    h_color = strength * CHROMA_RATIO if color_strength is None else color_strength
     return cv2.fastNlMeansDenoisingColored(
         image, None, float(strength), float(h_color), template_window, search_window
     )

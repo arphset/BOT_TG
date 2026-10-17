@@ -1,13 +1,72 @@
-"""Декодирование, кодирование и подготовка превью."""
+"""Декодирование, кодирование и подготовка превью.
+
+Пиксели читает OpenCV, а метаданные (ICC-профиль и EXIF) — Pillow: OpenCV их
+теряет. Без ICC-профиля фото, снятые в Display P3 (iPhone, многие Android),
+после обработки выглядят тусклее и с другим оттенком, хотя пиксели не испорчены.
+"""
 
 from __future__ import annotations
 
+import io
+import logging
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
+from PIL import Image, ImageCms
+
+logger = logging.getLogger(__name__)
+
+EXIF_ORIENTATION = 0x0112
 
 
 class ImageDecodeError(ValueError):
     """Файл не удалось прочитать как изображение."""
+
+
+@dataclass(frozen=True)
+class ImageMeta:
+    """Метаданные, которые нужно перенести в результат."""
+
+    icc_profile: bytes | None = None
+    exif: bytes | None = None
+
+
+def read_meta(data: bytes) -> ImageMeta:
+    """ICC-профиль и EXIF исходника. Ориентация в EXIF сбрасывается в 1,
+    потому что OpenCV при чтении уже повернул пиксели. Ошибки не критичны."""
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            icc = im.info.get("icc_profile") or None
+            exif_obj = im.getexif()
+            exif: bytes | None = None
+            if exif_obj:
+                exif_obj[EXIF_ORIENTATION] = 1
+                exif = exif_obj.tobytes()
+    except Exception:  # noqa: BLE001 — без метаданных обработка всё равно возможна
+        logger.info("метаданные исходника не прочитаны")
+        return ImageMeta()
+    return ImageMeta(icc_profile=icc, exif=exif)
+
+
+def to_srgb(image: np.ndarray, meta: ImageMeta) -> np.ndarray:
+    """Переводит пиксели из профиля исходника в sRGB.
+
+    Нужно для превью: Telegram пережимает фото и выбрасывает ICC-профиль,
+    поэтому превью должно быть уже в sRGB. Файл-документ отдаётся
+    с исходным профилем без преобразования.
+    """
+    if not meta.icc_profile:
+        return image
+    try:
+        src = ImageCms.ImageCmsProfile(io.BytesIO(meta.icc_profile))
+        dst = ImageCms.createProfile("sRGB")
+        pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        converted = ImageCms.profileToProfile(pil, src, dst, outputMode="RGB")
+        return cv2.cvtColor(np.asarray(converted), cv2.COLOR_RGB2BGR)
+    except Exception:  # noqa: BLE001
+        logger.info("не удалось перевести превью в sRGB, отдаю как есть")
+        return image
 
 
 def decode_image(data: bytes) -> np.ndarray:
@@ -29,15 +88,31 @@ def limit_megapixels(image: np.ndarray, max_megapixels: float) -> tuple[np.ndarr
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA), True
 
 
-def encode_image(image: np.ndarray, fmt: str = "jpg", quality: int = 95) -> bytes:
-    """Кодирует результат. ``fmt`` — ``jpg`` или ``png``."""
-    if fmt == "png":
-        ok, buf = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-    else:
-        ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        raise RuntimeError("не удалось закодировать изображение")
-    return buf.tobytes()
+def encode_image(image: np.ndarray, fmt: str = "jpg", quality: int = 95, meta: ImageMeta | None = None) -> bytes:
+    """Кодирует результат. ``fmt`` — ``jpg`` или ``png``.
+
+    JPEG сохраняется без цветового субсэмплинга (4:4:4): тонкие цветные края
+    не размываются. ICC-профиль и EXIF из ``meta`` переносятся в файл.
+    """
+    meta = meta or ImageMeta()
+    pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    extra: dict[str, bytes] = {}
+    if meta.icc_profile:
+        extra["icc_profile"] = meta.icc_profile
+    if meta.exif:
+        extra["exif"] = meta.exif
+    buf = io.BytesIO()
+    try:
+        if fmt == "png":
+            pil.save(buf, "PNG", compress_level=6, **extra)
+        else:
+            pil.save(buf, "JPEG", quality=quality, subsampling=0, optimize=True, **extra)
+    except Exception as exc:  # noqa: BLE001
+        if not extra:
+            raise RuntimeError("не удалось закодировать изображение") from exc
+        logger.warning("метаданные не записались (%s), сохраняю без них", exc)
+        return encode_image(image, fmt, quality, None)
+    return buf.getvalue()
 
 
 def fit(image: np.ndarray, max_side: int) -> np.ndarray:

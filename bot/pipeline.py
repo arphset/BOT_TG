@@ -35,7 +35,8 @@ from bot.algorithms import (
     unsharp_mask,
 )
 from bot.algorithms.hdr import exposure_spread
-from bot.algorithms.superres import Variant, realesrgan
+from bot.algorithms.color import color_correct
+from bot.algorithms.superres import OutputMode, Variant, output_is_x4, realesrgan_fit
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class SuperResSettings:
     tile: int = 384
     overlap: int = 16
     time_budget: float = 200.0
+    output: OutputMode = "auto"
 
 
 class PipelineCancelled(RuntimeError):
@@ -118,7 +120,8 @@ def _merge_series(frames: Sequence[np.ndarray]) -> np.ndarray:
 
 
 def _auto_denoise_strength(sigma: float) -> float:
-    return float(np.clip(sigma * 1.3, 3.0, 12.0))
+    """Сила NLM для яркости; цвет чистится сильнее (см. denoise.CHROMA_RATIO)."""
+    return float(np.clip(sigma * 1.05, 2.5, 10.0))
 
 
 def build_steps(
@@ -143,6 +146,7 @@ def build_steps(
 
     align = Step("align", "выравнивание кадров (ECC)", "series", align_frames, enabled=multi)
     merge = Step("merge", "слияние серии (Mertens / усреднение)", "merge", _merge_series, enabled=multi)
+    color = Step("color", "цветокоррекция (баланс белого, уровни, вибрация)", "image", color_correct)
 
     if mode is Mode.AUTO:
         need_denoise = effective_sigma > 2.0
@@ -156,6 +160,7 @@ def build_steps(
                 partial(nl_means, strength=_auto_denoise_strength(effective_sigma)),
                 enabled=need_denoise,
             ),
+            color,
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
             Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.2, amount=0.6)),
         ]
@@ -204,6 +209,7 @@ def build_steps(
                 "image",
                 partial(richardson_lucy, psf_sigma=1.0, iterations=10),
             ),
+            color,
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=2.0)),
             Step(
                 "sharpen",
@@ -217,7 +223,7 @@ def build_steps(
         return [
             align,
             merge,
-            _superres_step(variant, superres),
+            _superres_step(variant, superres, frames[0].shape),
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
             Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.5)),
         ]
@@ -229,7 +235,7 @@ def build_steps(
         return [
             align,
             merge,
-            _superres_step("general" if noisy else "wdn", superres),
+            _superres_step("general" if noisy else "wdn", superres, frames[0].shape),
             Step(
                 "denoise",
                 "шумоподавление (non-local means)",
@@ -238,20 +244,23 @@ def build_steps(
                 enabled=noisy,
                 fallback_for="superres",
             ),
+            color,
             Step("contrast", "локальный контраст (CLAHE, Lab)", "image", partial(clahe_lab, clip_limit=1.5)),
             Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.5, amount=0.5)),
         ]
     raise ValueError(f"неизвестный режим: {mode}")
 
 
-def _superres_step(variant: Variant, superres: SuperResSettings) -> Step:
+def _superres_step(variant: Variant, superres: SuperResSettings, shape: tuple[int, ...]) -> Step:
+    size = "×4" if output_is_x4(shape, superres.output, superres.max_side) else "в исходном размере"
     return Step(
         "superres",
-        f"нейросеть Real-ESRGAN ×4 ({variant}-x4v3)",
+        f"нейросеть Real-ESRGAN {size} ({variant}-x4v3)",
         "image",
         partial(
-            realesrgan,
+            realesrgan_fit,
             variant=variant,
+            output=superres.output,
             max_side=superres.max_side,
             tile=superres.tile,
             overlap=superres.overlap,

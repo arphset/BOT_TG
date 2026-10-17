@@ -21,6 +21,13 @@ def _float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _choice(name: str, default: str, allowed: set[str]) -> str:
+    value = os.getenv(name, "").strip().lower() or default
+    if value not in allowed:
+        raise ConfigError(f"{name} должна быть одним из: {', '.join(sorted(allowed))}")
+    return value
+
+
 def _required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -44,6 +51,7 @@ class Config:
     sr_timeout: float
     sr_tile: int
     sr_max_side: int
+    sr_output: str
 
     @property
     def kv_enabled(self) -> bool:
@@ -68,4 +76,5 @@ def get_config() -> Config:
         sr_timeout=_float("SR_TIMEOUT", 200.0),
         sr_tile=_int("SR_TILE", 384),
         sr_max_side=_int("SR_MAX_SIDE", 1024),
+        sr_output=_choice("SR_OUTPUT", "auto", {"auto", "x4", "original"}),
     )
