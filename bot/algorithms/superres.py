@@ -144,6 +144,7 @@ def fuse_detail(
     detail_sigma: float = 1.2,
     threshold_k: float = 2.5,
     amount: float = 0.8,
+    face_weight: np.ndarray | None = None,
 ) -> np.ndarray:
     """Переносит реальные мелкие детали оригинала в восстановленное нейросетью изображение.
 
@@ -152,6 +153,10 @@ def fuse_detail(
     мягкий порог по уровню шума: всё, что слабее ~``threshold_k``·σ, считается
     шумом и отбрасывается, сильное (края, текстура) сохраняется. В каждой
     точке берётся та деталь, что сильнее: оригинала или нейросети.
+
+    ``face_weight`` (маска лиц 0..1): на лицах порог ниже, а доля деталей
+    оригинала выше — реальная фактура кожи, ресниц и бровей сохраняется,
+    лицо не становится «пластиковым».
     """
     ensure_bgr_u8(original)
     ensure_bgr_u8(restored)
@@ -165,8 +170,12 @@ def fuse_detail(
     hp_r = l_r - base_r
 
     t = max(threshold_k * noise_sigma * 100.0 / 255.0, 0.5)  # σ в единицах серого → единицы L
+    amt: float | np.ndarray = amount
+    if face_weight is not None and face_weight.any():
+        t = t * (1.0 - 0.4 * face_weight)  # на лицах порог ниже: больше реальной фактуры
+        amt = amount + (1.0 - amount) * face_weight
     weight = np.clip((np.abs(hp_o) - t) / t, 0.0, 1.0)  # 0 ниже порога, 1 выше 2t
-    real = hp_o * weight * amount
+    real = hp_o * weight * amt
     detail = np.where(np.abs(real) > np.abs(hp_r), real, hp_r)
     lab_r[:, :, 0] = np.clip(base_r + detail, 0.0, 100.0)
     return from_lab(lab_r)
@@ -184,6 +193,7 @@ def realesrgan_fit(
     overlap: int = 16,
     time_budget: float | None = None,
     threads: int = 1,
+    face_aware: bool = False,
 ) -> np.ndarray:
     """Real-ESRGAN с выбором размера результата.
 
@@ -202,7 +212,12 @@ def realesrgan_fit(
     h, w = image.shape[:2]
     interp = cv2.INTER_AREA if up.shape[0] >= h else cv2.INTER_CUBIC
     restored = cv2.resize(up, (w, h), interpolation=interp)
-    return fuse_detail(image, restored, estimate_noise(image))
+    faces_mask = None
+    if face_aware:
+        from bot.algorithms.faces import face_mask
+
+        faces_mask = face_mask(image)
+    return fuse_detail(image, restored, estimate_noise(image), face_weight=faces_mask)
 
 
 def output_is_x4(shape: tuple[int, ...], output: str, max_side: int) -> bool:

@@ -26,7 +26,6 @@ logger = logging.getLogger("set_webhook")
 
 COMMANDS = [
     BotCommand(command="start", description="Приветствие и справка"),
-    BotCommand(command="mode", description="Режим обработки по умолчанию"),
     BotCommand(command="help", description="Справка"),
 ]
 

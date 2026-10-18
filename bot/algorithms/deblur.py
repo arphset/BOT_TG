@@ -171,3 +171,54 @@ def describe_blur(blur: BlurEstimate) -> str:
     if blur.is_directional:
         return f"смаз σ≈{blur.sigma_major:.1f} px, направление {blur.angle:.0f}°"
     return f"размытие σ≈{blur.sigma_major:.1f} px"
+
+
+def deblur_faces(
+    image: np.ndarray,
+    faces: list[tuple[int, int, int, int]] | None = None,
+    global_blur: BlurEstimate | None = None,
+    min_sigma: float = 0.7,
+    max_sigma: float = 3.0,
+) -> np.ndarray:
+    """Отдельная деконволюция лиц.
+
+    Лицо часто смазано сильнее остального кадра (человек двигался, фокус ушёл на
+    фон). Смаз оценивается по рамке каждого лица; если он заметен и
+    больше уже убранного общего смаза ``global_blur``, область лица
+    восстанавливается своим ядром (остаточный смаз √(σ_лица² − σ_общий²))
+    и вклеивается по растушёванной маске кожи.
+    """
+    from bot.algorithms.faces import detect_faces, face_mask  # локально: faces → deblur не нужен
+
+    ensure_bgr_u8(image)
+    faces = detect_faces(image) if faces is None else faces
+    if not faces:
+        return image.copy()
+    h, w = image.shape[:2]
+    mask = face_mask(image, faces)
+    out = image.astype(np.float32)
+    base_sigma = 0.0 if global_blur is None or global_blur.is_sharp else global_blur.sigma_major
+    changed = False
+    for x, y, fw, fh in faces:
+        size = max(fw, fh)
+        cx, cy = x + fw / 2, y + fh / 2
+        x0, x1 = int(max(0, cx - 1.8 * size)), int(min(w, cx + 1.8 * size))
+        y0, y1 = int(max(0, cy - 1.6 * size)), int(min(h, cy + 1.9 * size))
+        crop = image[y0:y1, x0:x1]
+        # Смаз оцениваем по самой рамке лица (немного расширенной): в большом окне
+        # резкий фон перевесил бы. Большое окно нужно только для восстановления.
+        ex0, ex1 = int(max(0, cx - 0.65 * fw)), int(min(w, cx + 0.65 * fw))
+        ey0, ey1 = int(max(0, cy - 0.65 * fh)), int(min(h, cy + 0.65 * fh))
+        est = estimate_blur(image[ey0:ey1, ex0:ex1])
+        residual = float(np.sqrt(max(est.sigma_major**2 - base_sigma**2, 0.0)))
+        if residual < min_sigma:
+            continue
+        ratio = residual / max(est.sigma_major, 1e-6)
+        face_blur = BlurEstimate(residual, est.sigma_minor * ratio, est.angle)
+        restored = smart_deblur(crop, face_blur, max_sigma=max_sigma).astype(np.float32)
+        m = mask[y0:y1, x0:x1, None]
+        out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1.0 - m) + restored * m
+        changed = True
+    if not changed:
+        return image.copy()
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)

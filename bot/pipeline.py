@@ -34,7 +34,11 @@ from bot.algorithms import (
 )
 from bot.algorithms.color import color_correct
 from bot.algorithms.deblock import deblock, is_blocky
-from bot.algorithms.deblur import describe_blur, estimate_blur, smart_deblur
+from bot.algorithms.deblur import BlurEstimate, deblur_faces, describe_blur, estimate_blur, smart_deblur
+from bot.algorithms.dehaze import dehaze, estimate_haze
+from bot.algorithms.faces import detect_faces
+from bot.algorithms.horizon import detect_tilt, straighten
+from bot.algorithms.tone import estimate_tone, shadows_highlights
 from bot.algorithms.denoise import denoise_by_luma
 from bot.algorithms.hdr import exposure_spread
 from bot.algorithms.superres import VARIANT_TITLES, OutputMode, Variant, output_is_x4, realesrgan_fit
@@ -53,6 +57,7 @@ class Mode(str, Enum):
     NEURAL = "neural"
     NEURAL_WDN = "neural_wdn"
     AUTO_NEURAL = "auto_neural"
+    SMART = "smart"
 
 
 MODE_TITLES: dict[Mode, str] = {
@@ -64,9 +69,15 @@ MODE_TITLES: dict[Mode, str] = {
     Mode.NEURAL: "Нейросеть ×4",
     Mode.NEURAL_WDN: "Нейросеть ×4, детали",
     Mode.AUTO_NEURAL: "Авто + нейросеть",
+    Mode.SMART: "Авто",
 }
 
-NEURAL_MODES = frozenset({Mode.NEURAL, Mode.NEURAL_WDN, Mode.AUTO_NEURAL})
+# Уровни силы умного режима (кнопки «Слабее» / «Сильнее»).
+STRENGTH_LEVELS: tuple[float, ...] = (0.5, 0.75, 1.0, 1.3, 1.6)
+STRENGTH_TITLES: tuple[str, ...] = ("очень мягко", "мягче", "обычно", "сильнее", "очень сильно")
+DEFAULT_LEVEL = 2
+
+NEURAL_MODES = frozenset({Mode.NEURAL, Mode.NEURAL_WDN, Mode.AUTO_NEURAL, Mode.SMART})
 
 
 @dataclass(frozen=True)
@@ -137,6 +148,7 @@ def build_steps(
     mode: Mode,
     frames: Sequence[np.ndarray],
     superres: SuperResSettings = SuperResSettings(),
+    strength: float = 1.0,
 ) -> list[Step]:
     """Собирает список шагов для режима.
 
@@ -244,7 +256,111 @@ def build_steps(
             contrast_step(1.5),
             sharpen_step(1.5, 0.4),
         ]
+    if mode is Mode.SMART:
+        return _smart_steps(first, effective_sigma, blocky, superres, strength, align, merge)
     raise ValueError(f"неизвестный режим: {mode}")
+
+
+def _shift_variant(variant: Variant, strength: float) -> Variant:
+    """Слабее — модель, которая меньше сглаживает; сильнее — которая больше чистит."""
+    order: list[Variant] = ["wdn", "balanced", "general"]
+    i = order.index(variant)
+    if strength <= 0.75:
+        i = max(0, i - 1)
+    elif strength >= 1.3:
+        i = min(len(order) - 1, i + 1)
+    return order[i]
+
+
+def _smart_steps(
+    first: np.ndarray,
+    effective_sigma: float,
+    blocky: bool,
+    superres: SuperResSettings,
+    k: float,
+    align: Step,
+    merge: Step,
+) -> list[Step]:
+    """Умный режим: кадр анализируется, включаются только нужные шаги, сила — ``k``.
+
+    Порядок: смаз (весь кадр, затем лица — до нейросети: деконволюция усиливает
+    шум, а нейросеть его потом убирает) → Real-ESRGAN (детали лиц бережнее)
+    → запасные деблокинг/шум → дымка → тени и света → цвет → адаптивный CLAHE
+    → горизонт (поворот сдвигает координаты лиц, поэтому после шагов по лицам)
+    → резкость последней.
+    """
+    blur = estimate_blur(first)
+    deblur_on = blur.sigma_major >= 0.8
+    blur_factor = float(np.clip(0.55 + 0.3 * k, 0.6, 1.05))  # «обычно» — 85 % оценённого смаза
+    scaled_blur = BlurEstimate(blur.sigma_major * blur_factor, blur.sigma_minor * blur_factor, blur.angle)
+    faces = detect_faces(first)
+    haze = estimate_haze(first)
+    tone = estimate_tone(first)
+    tilt = detect_tilt(first)
+    variant = _shift_variant(pick_variant(effective_sigma), k)
+    logger.info(
+        "умный режим: смаз σ=%.2f, лиц=%d, дымка=%s, тени=%.2f, света=%.2f, наклон=%s, модель=%s, сила=%.2f",
+        blur.sigma_major, len(faces), haze.is_hazy, tone.shadows, tone.highlights, tilt, variant, k,
+    )
+    sr = _superres_step(variant, superres, first.shape)
+    sr = replace(sr, func=partial(sr.func, face_aware=True))
+    return [
+        align,
+        merge,
+        Step(
+            "deblur",
+            f"устранение смаза ({describe_blur(blur)})",
+            "image",
+            partial(smart_deblur, blur=scaled_blur),
+            enabled=deblur_on,
+        ),
+        Step(
+            "face_deblur",
+            f"резкость лиц (найдено: {len(faces)})",
+            "image",
+            partial(deblur_faces, faces=faces, global_blur=scaled_blur if deblur_on else None),
+            enabled=bool(faces),
+        ),
+        sr,
+        Step("deblock", "удаление JPEG-артефактов (деблокинг)", "image", deblock, enabled=blocky, fallback_for="superres"),
+        Step(
+            "denoise",
+            "шумоподавление (non-local means, по зонам яркости)",
+            "image",
+            partial(denoise_by_luma, scale=1.05 * k),
+            enabled=effective_sigma > 2.0,
+            fallback_for="superres",
+        ),
+        Step("dehaze", "удаление дымки", "image", partial(dehaze, haze=haze, scale=k), enabled=haze.is_hazy),
+        Step(
+            "tone",
+            "тени и света",
+            "image",
+            partial(shadows_highlights, shadows=tone.shadows, highlights=tone.highlights, scale=k),
+            enabled=tone.needed,
+        ),
+        Step(
+            "color",
+            "цветокоррекция (баланс белого, уровни, вибрация)",
+            "image",
+            partial(color_correct, wb_strength=min(0.6 * k, 0.9), vibrance_amount=0.2 * k),
+        ),
+        Step(
+            "contrast",
+            "локальный контраст (адаптивный CLAHE, Lab)",
+            "image",
+            partial(clahe_lab, clip_limit=1.5 * k, adaptive=True),
+        ),
+        Step(
+            "horizon",
+            f"выравнивание горизонта ({0.0 if tilt is None else tilt:+.1f}°)",
+            "image",
+            partial(straighten, angle=tilt),
+            enabled=tilt is not None,
+        ),
+        # Резкость слабее, чем в других режимах: деконволюция уже вернула часть резкости.
+        Step("sharpen", "нерезкое маскирование", "image", partial(unsharp_mask, sigma=1.3, amount=0.28 * k)),
+    ]
 
 
 def _superres_step(variant: Variant, superres: SuperResSettings, shape: tuple[int, ...]) -> Step:

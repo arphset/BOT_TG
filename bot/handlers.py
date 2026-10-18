@@ -36,7 +36,10 @@ from bot.media import (
     to_srgb,
 )
 from bot.pipeline import (
+    DEFAULT_LEVEL,
     MODE_TITLES,
+    STRENGTH_LEVELS,
+    STRENGTH_TITLES,
     Mode,
     PipelineCancelled,
     PipelineResult,
@@ -44,7 +47,6 @@ from bot.pipeline import (
     build_steps,
     run_pipeline,
 )
-from bot.storage import get_storage
 
 logger = logging.getLogger(__name__)
 router = Router(name="photo")
@@ -55,25 +57,19 @@ UPLOAD_LIMIT = 49 * 1024 * 1024
 
 HELP_TEXT = (
     "<b>Как пользоваться</b>\n"
-    "1. Пришлите фото <b>файлом</b> (скрепка → Файл), чтобы Telegram его не сжал.\n"
-    "2. Выберите режим кнопкой.\n"
-    "3. Получите результат файлом без сжатия, превью и сравнение «до / после».\n\n"
-    "<b>Режимы</b>\n"
-    "• <b>Авто</b> — шумоподавление по оценке шума, цветокоррекция (баланс белого, уровни), локальный контраст, лёгкая резкость.\n"
-    "• <b>Шум</b> — только non-local means.\n"
-    "• <b>Резкость</b> — нерезкое маскирование.\n"
-    "• <b>Размытие</b> — деконволюция Ричардсона–Люси (для слегка смазанных кадров).\n"
-    "• <b>Полный конвейер</b> — шум → деконволюция → контраст → резкость.\n"
-    "• <b>Авто + нейросеть</b> — модель подбирается по шуму (шумное фото — сильная чистка, чистое — «детали»), "
-    "затем контраст и мягкая резкость. Если нейросеть не успела, выполняется обычное «Авто».\n"
-    "• <b>Нейросеть ×4</b> — Real-ESRGAN (realesr-general-x4v3) → контраст → мягкая резкость. "
-    "Маленькие фото (до 1024 px) увеличиваются в 4 раза, большие остаются в исходном размере, а реальные детали переносятся из оригинала. "
-    "Обычный вариант сильнее подавляет шум; «детали» (модель wdn) сглаживает меньше и сохраняет текстуру. "
-    "Обработка до нескольких минут.\n\n"
-    "<b>Команды</b>\n"
-    "/mode — режим по умолчанию (тогда кнопки не нужны)\n"
-    "/help — эта справка\n\n"
-    "Ограничения: файл до 20 МБ."
+    "Просто пришлите фото — лучше <b>файлом</b> (скрепка → Файл), чтобы Telegram его не сжал. "
+    "Я сам разберусь, что с ним делать, и пришлю результат файлом без сжатия, превью и сравнение «до / после».\n\n"
+    "Не понравилась сила обработки — под файлом есть кнопки <b>«Слабее»</b> и <b>«Сильнее»</b>: "
+    "фото переделывается из оригинала, уровней пять.\n\n"
+    "<b>Что я делаю (только то, что нужно этому фото)</b>\n"
+    "• убираю смаз и отдельно — смаз лиц;\n"
+    "• нейросеть Real-ESRGAN: шум, артефакты сжатия, детали; маленькие фото увеличиваю в 4 раза;\n"
+    "• убираю дымку, вытягиваю тени и выбитые света;\n"
+    "• баланс белого, уровни, цвет, локальный контраст;\n"
+    "• выравниваю завал горизонта (0,5–6°, с небольшой обрезкой);\n"
+    "• мягкая резкость в конце.\n"
+    "В подписи к файлу видно, какие шаги сработали.\n\n"
+    "Обработка — до минуты-двух. Файл до 20 МБ."
 )
 
 
@@ -95,29 +91,14 @@ router.message.filter(AllowedUser())
 router.callback_query.filter(AllowedUser())
 
 
-def modes_keyboard(prefix: str, with_reset: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=MODE_TITLES[Mode.AUTO], callback_data=f"{prefix}:{Mode.AUTO.value}")],
-        [
-            InlineKeyboardButton(text=MODE_TITLES[Mode.DENOISE], callback_data=f"{prefix}:{Mode.DENOISE.value}"),
-            InlineKeyboardButton(text=MODE_TITLES[Mode.SHARPEN], callback_data=f"{prefix}:{Mode.SHARPEN.value}"),
-            InlineKeyboardButton(text=MODE_TITLES[Mode.DEBLUR], callback_data=f"{prefix}:{Mode.DEBLUR.value}"),
-        ],
-        [InlineKeyboardButton(text=MODE_TITLES[Mode.FULL], callback_data=f"{prefix}:{Mode.FULL.value}")],
-    ]
-    if get_config().sr_enabled:
-        rows.append(
-            [InlineKeyboardButton(text=MODE_TITLES[Mode.AUTO_NEURAL], callback_data=f"{prefix}:{Mode.AUTO_NEURAL.value}")]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(text=MODE_TITLES[Mode.NEURAL], callback_data=f"{prefix}:{Mode.NEURAL.value}"),
-                InlineKeyboardButton(text=MODE_TITLES[Mode.NEURAL_WDN], callback_data=f"{prefix}:{Mode.NEURAL_WDN.value}"),
-            ]
-        )
-    if with_reset:
-        rows.append([InlineKeyboardButton(text="Спрашивать каждый раз", callback_data=f"{prefix}:ask")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def strength_keyboard(level: int) -> InlineKeyboardMarkup | None:
+    """Кнопки «Слабее» / «Сильнее» под результатом умного режима."""
+    row: list[InlineKeyboardButton] = []
+    if level > 0:
+        row.append(InlineKeyboardButton(text="− Слабее", callback_data=f"lvl:{level - 1}"))
+    if level < len(STRENGTH_LEVELS) - 1:
+        row.append(InlineKeyboardButton(text="Сильнее +", callback_data=f"lvl:{level + 1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
 
 
 @dataclass(frozen=True)
@@ -159,40 +140,6 @@ async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
 
 
-@router.message(Command("mode"))
-async def cmd_mode(message: Message) -> None:
-    storage = get_storage()
-    if not storage.enabled:
-        await message.answer(
-            "Режим по умолчанию сохраняется во внешнем хранилище, а оно не подключено "
-            "(нет KV_REST_API_URL / KV_REST_API_TOKEN). Пока выбирайте режим кнопками под каждым фото."
-        )
-        return
-    current = await storage.get_mode(message.from_user.id) if message.from_user else None
-    current_title = MODE_TITLES[Mode(current)] if current in {m.value for m in Mode} else "спрашивать каждый раз"
-    await message.answer(
-        f"Сейчас: <b>{current_title}</b>. Выберите режим по умолчанию:",
-        reply_markup=modes_keyboard("default", with_reset=True),
-    )
-
-
-@router.callback_query(F.data.startswith("default:"))
-async def on_default_mode(callback: CallbackQuery) -> None:
-    value = (callback.data or "").split(":", 1)[1]
-    mode = None if value == "ask" else value
-    if mode is not None and mode not in {m.value for m in Mode}:
-        await callback.answer("Неизвестный режим", show_alert=True)
-        return
-    saved = await get_storage().set_mode(callback.from_user.id, mode)
-    if not saved:
-        await callback.answer("Не удалось сохранить, хранилище недоступно", show_alert=True)
-        return
-    title = MODE_TITLES[Mode(mode)] if mode else "спрашивать каждый раз"
-    await callback.answer("Сохранено")
-    if isinstance(callback.message, Message):
-        await callback.message.edit_text(f"Режим по умолчанию: <b>{title}</b>.")
-
-
 # ---------- приём фото ----------
 
 
@@ -205,18 +152,36 @@ async def on_image(message: Message, bot: Bot) -> None:
     if not _check_size(source):
         await message.reply(_too_big_text())
         return
+    status = await message.reply("Обрабатываю… Обычно это занимает до минуты.")
+    await process_and_reply(bot, message, source, Mode.SMART, status, level=DEFAULT_LEVEL)
 
-    default_mode = await get_storage().get_mode(message.from_user.id) if message.from_user else None
-    if default_mode in {m.value for m in Mode}:
-        mode = Mode(default_mode)
-        status = await message.reply(f"Обрабатываю в режиме «{MODE_TITLES[mode]}»…")
-        await process_and_reply(bot, message, source, mode, status)
+
+@router.callback_query(F.data.startswith("lvl:"))
+async def on_strength(callback: CallbackQuery, bot: Bot) -> None:
+    """«Слабее» / «Сильнее»: переделать то же фото из оригинала с другой силой."""
+    try:
+        level = int((callback.data or "").split(":", 1)[1])
+        if not 0 <= level < len(STRENGTH_LEVELS):
+            raise ValueError
+    except ValueError:
+        await callback.answer("Неизвестный уровень", show_alert=True)
         return
-
-    hint = ""
-    if source.compressed:
-        hint = "\n\n<i>Фото пришло сжатым. Для лучшего результата отправляйте его файлом.</i>"
-    await message.reply("Выберите режим обработки:" + hint, reply_markup=modes_keyboard("mode"))
+    result_message = callback.message
+    # Результат — ответ на сообщение с фото, поэтому исходник берём оттуда: без хранилища.
+    original = result_message.reply_to_message if isinstance(result_message, Message) else None
+    source = extract_source(original) if original is not None else None
+    if not isinstance(result_message, Message) or original is None or source is None:
+        await callback.answer("Не нашёл исходное фото. Пришлите его ещё раз.", show_alert=True)
+        return
+    title = STRENGTH_TITLES[level]
+    await callback.answer(f"Переделываю: {title}")
+    # Снимаем кнопки со старого результата, чтобы повторный тап не запустил вторую обработку.
+    try:
+        await result_message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    status = await original.reply(f"Переделываю ({title})…")
+    await process_and_reply(bot, original, source, Mode.SMART, status, level=level)
 
 
 @router.callback_query(F.data.startswith("mode:"))
@@ -237,6 +202,7 @@ async def on_mode_chosen(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Не нашёл исходное фото. Пришлите его ещё раз.", show_alert=True)
         return
 
+    # Кнопки режимов остались на сообщениях, отправленных до умного режима, — они продолжают работать.
     await callback.answer(f"Режим: {MODE_TITLES[mode]}")
     # Убираем кнопки сразу, чтобы повторное нажатие не запустило вторую обработку.
     await menu.edit_text(f"Обрабатываю в режиме «{MODE_TITLES[mode]}»…")
@@ -245,7 +211,7 @@ async def on_mode_chosen(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.message()
 async def on_other(message: Message) -> None:
-    await message.answer("Пришлите фото файлом, и я предложу режимы обработки. Справка: /help")
+    await message.answer("Пришлите фото — лучше файлом, — и я его улучшу. Справка: /help")
 
 
 @router.errors()
@@ -281,8 +247,19 @@ def _too_big_text() -> str:
     )
 
 
-def _format_report(result: PipelineResult, total: float, downscaled: bool, mode: Mode) -> str:
-    lines = [f"<b>Готово</b> · режим «{MODE_TITLES[mode]}»", f"Время обработки: {result.elapsed:.1f} с (всего {total:.1f} с)"]
+def _format_report(
+    result: PipelineResult,
+    total: float,
+    downscaled: bool,
+    mode: Mode,
+    level: int | None = None,
+    compressed: bool = False,
+) -> str:
+    if level is not None:
+        head = f"<b>Готово</b> · сила: {STRENGTH_TITLES[level]}"
+    else:
+        head = f"<b>Готово</b> · режим «{MODE_TITLES[mode]}»"
+    lines = [head, f"Время обработки: {result.elapsed:.1f} с (всего {total:.1f} с)"]
     if result.applied:
         lines.append("Шаги: " + ", ".join(result.applied) + ".")
     else:
@@ -296,6 +273,8 @@ def _format_report(result: PipelineResult, total: float, downscaled: bool, mode:
             )
         else:
             lines.append(f"⚠️ Шаг «{err.title}» не выполнен ({html.escape(err.message)}), пропущен.")
+    if compressed:
+        lines.append("<i>Фото пришло сжатым Telegram; если отправить файлом, результат будет лучше.</i>")
     return "\n".join(lines)
 
 
@@ -312,7 +291,14 @@ async def _safe_edit(message: Message, text: str) -> None:
         await message.answer(text)
 
 
-async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mode: Mode, status: Message) -> None:
+async def process_and_reply(
+    bot: Bot,
+    original: Message,
+    source: SourceFile,
+    mode: Mode,
+    status: Message,
+    level: int | None = None,
+) -> None:
     """Скачивает, обрабатывает и отправляет результат. Любую ошибку превращает в понятное сообщение."""
     cfg = get_config()
     started = time.perf_counter()
@@ -343,6 +329,7 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
 
     stop = threading.Event()
     frames = [image]
+    strength = STRENGTH_LEVELS[level] if level is not None else 1.0
     superres = SuperResSettings(
         enabled=cfg.sr_enabled,
         max_side=cfg.sr_max_side,
@@ -353,7 +340,7 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(
-                lambda: run_pipeline(frames, build_steps(mode, frames, superres), should_stop=stop.is_set)
+                lambda: run_pipeline(frames, build_steps(mode, frames, superres, strength), should_stop=stop.is_set)
             ),
             timeout=cfg.process_timeout,
         )
@@ -363,7 +350,7 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
         await _safe_edit(
             status,
             f"Не успел обработать фото за {cfg.process_timeout:.0f} с. "
-            "Попробуйте режим попроще («Резкость», «Размытие») или кадр меньшего размера.",
+            "Попробуйте «Слабее» или пришлите кадр меньшего размера.",
         )
         return
 
@@ -381,7 +368,7 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
         # Бот может отправить файл до 50 МБ; большой PNG пересохраняем в JPEG.
         out_name = PurePath(out_name).with_suffix(".jpg").name
         encoded = await asyncio.to_thread(lambda: encode_image(result.image, "jpg", 95, meta=meta))
-    report = _format_report(result, time.perf_counter() - started, downscaled, mode)
+    report = _format_report(result, time.perf_counter() - started, downscaled, mode, level, source.compressed)
 
     await original.reply_media_group(
         media=[
@@ -389,7 +376,11 @@ async def process_and_reply(bot: Bot, original: Message, source: SourceFile, mod
             InputMediaPhoto(media=BufferedInputFile(comparison, "compare.jpg"), caption="До / после"),
         ]
     )
-    await original.reply_document(document=BufferedInputFile(encoded, out_name), caption=report)
+    await original.reply_document(
+        document=BufferedInputFile(encoded, out_name),
+        caption=report,
+        reply_markup=strength_keyboard(level) if level is not None else None,
+    )
     try:
         await status.delete()
     except TelegramBadRequest:

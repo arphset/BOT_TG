@@ -15,6 +15,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import (
     AnswerCallbackQuery,
     DeleteMessage,
+    EditMessageReplyMarkup,
     EditMessageText,
     GetFile,
     SendDocument,
@@ -54,7 +55,7 @@ class FakeSession(BaseSession):
         if isinstance(method, GetFile):
             data = self.files[method.file_id]
             return File(file_id=method.file_id, file_unique_id="u", file_size=len(data), file_path=method.file_id)
-        if isinstance(method, (AnswerCallbackQuery, DeleteMessage)):
+        if isinstance(method, (AnswerCallbackQuery, DeleteMessage, EditMessageReplyMarkup)):
             return True
         return True
 
@@ -180,13 +181,13 @@ async def test_start(session: FakeSession) -> None:
 async def test_help(session: FakeSession) -> None:
     await call_app(body=text_update("/help"))
     [msg] = session.of_type(SendMessage)
-    assert "Режимы" in msg.text
+    assert "Слабее" in msg.text and "Сильнее" in msg.text
 
 
-async def test_mode_without_storage(session: FakeSession) -> None:
+async def test_mode_command_removed(session: FakeSession) -> None:
     await call_app(body=text_update("/mode"))
     [msg] = session.of_type(SendMessage)
-    assert "хранилище" in msg.text
+    assert "Пришлите фото" in msg.text
 
 
 async def test_allowed_users_filter(session: FakeSession, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,23 +202,71 @@ async def test_allowed_users_filter(session: FakeSession, monkeypatch: pytest.Mo
 # ---------- фото ----------
 
 
-async def test_photo_document_gets_mode_keyboard(session: FakeSession) -> None:
-    await call_app(body={"update_id": 2, "message": document_message("f1")})
-    [msg] = session.of_type(SendMessage)
-    buttons = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
-    assert buttons == ["Авто", "Шум", "Резкость", "Размытие", "Полный конвейер", "Авто + нейросеть", "Нейросеть ×4", "Нейросеть ×4, детали"]
-    assert msg.reply_parameters.message_id == 5
+def strength_buttons(doc: SendDocument) -> list[tuple[str, str]]:
+    markup = doc.reply_markup
+    return [(b.text, b.callback_data) for row in markup.inline_keyboard for b in row] if markup else []
 
 
-async def test_neural_buttons_hidden_when_disabled(session: FakeSession, monkeypatch: pytest.MonkeyPatch) -> None:
-    from bot.config import get_config
+async def test_photo_processed_immediately(session: FakeSession) -> None:
+    session.files["f1"] = jpeg_bytes(add_noise(make_scene(), 8))
+    await call_app(body={"update_id": 2, "message": document_message("f1", "IMG_7.jpg")})
+    [status] = session.of_type(SendMessage)
+    assert "Обрабатываю" in status.text and status.reply_parameters.message_id == 5
+    [doc] = session.of_type(SendDocument)
+    assert doc.document.filename == "IMG_7_enhanced.jpg"
+    assert "сила: обычно" in doc.caption
+    assert strength_buttons(doc) == [("− Слабее", "lvl:1"), ("Сильнее +", "lvl:3")]
+    assert session.of_type(SendMediaGroup)
 
-    monkeypatch.setenv("SR_ENABLED", "0")
-    get_config.cache_clear()
-    await call_app(body={"update_id": 2, "message": document_message("f1")})
-    [msg] = session.of_type(SendMessage)
-    buttons = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
-    assert not any("Нейросеть" in b for b in buttons)
+
+async def test_compressed_photo_hint(session: FakeSession) -> None:
+    session.files["p1"] = jpeg_bytes(make_scene())
+    message = {
+        "message_id": 9,
+        "date": 0,
+        "chat": CHAT,
+        "from": USER,
+        "photo": [{"file_id": "p1", "file_unique_id": "u", "width": 320, "height": 240, "file_size": 1000}],
+    }
+    await call_app(body={"update_id": 4, "message": message})
+    [doc] = session.of_type(SendDocument)
+    assert "сжатым" in doc.caption
+
+
+@pytest.mark.parametrize(
+    ("level", "title", "buttons"),
+    [
+        (3, "сильнее", [("− Слабее", "lvl:2"), ("Сильнее +", "lvl:4")]),
+        (0, "очень мягко", [("Сильнее +", "lvl:1")]),
+        (4, "очень сильно", [("− Слабее", "lvl:3")]),
+    ],
+)
+async def test_strength_buttons_reprocess(session: FakeSession, level: int, title: str, buttons: list) -> None:
+    session.files["f1"] = jpeg_bytes(make_scene())
+    await call_app(body=callback_update(f"lvl:{level}", document_message("f1")))
+    assert session.of_type(EditMessageReplyMarkup)  # кнопки со старого результата сняты
+    [doc] = session.of_type(SendDocument)
+    assert f"сила: {title}" in doc.caption
+    assert strength_buttons(doc) == buttons
+
+
+async def test_strength_levels_change_result(session: FakeSession) -> None:
+    session.files["f1"] = jpeg_bytes(cv2.GaussianBlur(add_noise(make_scene(), 6), (0, 0), 1.2))
+    results = []
+    for level in (0, 4):
+        session.calls.clear()
+        webhook._recent_updates.clear()
+        await call_app(body=callback_update(f"lvl:{level}", document_message("f1")))
+        [doc] = session.of_type(SendDocument)
+        results.append(cv2.imdecode(np.frombuffer(doc.document.data, np.uint8), cv2.IMREAD_COLOR).astype(int))
+    assert np.abs(results[0] - results[1]).mean() > 1.0
+
+
+async def test_bad_strength_level(session: FakeSession) -> None:
+    await call_app(body=callback_update("lvl:9", document_message("f1")))
+    [answer] = session.of_type(AnswerCallbackQuery)
+    assert answer.show_alert
+    assert session.of_type(SendDocument) == []
 
 
 async def test_neural_mode_returns_x4_document(session: FakeSession) -> None:
